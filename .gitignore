@@ -1,0 +1,9 @@
+# Real recordings and generated ofrendas stay on this machine, never on GitHub.
+ofrendas/
+*.m4a
+*.mp3
+*.wav
+*.ogg
+__pycache__/
+.venv/
+.DS_Store
