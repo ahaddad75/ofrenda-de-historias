@@ -17,6 +17,9 @@ Usage:
 
 import argparse
 import json
+import shutil
+import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -56,14 +59,51 @@ Rules:
 """
 
 
+# Places where mlx_whisper is commonly installed on macOS, used when this
+# Python interpreter cannot import it (e.g. a uv-managed Python vs python.org).
+WHISPER_CLI_CANDIDATES = [
+    "mlx_whisper",
+    "/Library/Frameworks/Python.framework/Versions/3.12/bin/mlx_whisper",
+    "/opt/homebrew/bin/mlx_whisper",
+    str(Path.home() / ".local/bin/mlx_whisper"),
+]
+
+
+def _find_whisper_cli() -> str | None:
+    for cand in WHISPER_CLI_CANDIDATES:
+        found = shutil.which(cand) or (cand if Path(cand).is_file() else None)
+        if found:
+            return found
+    return None
+
+
 def transcribe(audio_path: Path, whisper_model: str) -> tuple[str, str]:
+    print(f"Transcribing {audio_path.name} with Whisper (local)…", file=sys.stderr)
     try:
         import mlx_whisper
+
+        result = mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=whisper_model)
+        return result["text"].strip(), result.get("language", "?")
     except ImportError:
-        sys.exit("mlx_whisper is not installed: pip install mlx-whisper")
-    print(f"Transcribing {audio_path.name} with Whisper (local)…", file=sys.stderr)
-    result = mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=whisper_model)
+        pass
+
+    # Fallback: call the mlx_whisper command-line tool installed elsewhere.
+    cli = _find_whisper_cli()
+    if not cli:
+        sys.exit("mlx-whisper not found. Install it with: python3 -m pip install mlx-whisper")
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [cli, str(audio_path), "--model", whisper_model,
+               "--output-format", "json", "--output-dir", tmp]
+        subprocess.run(cmd, check=True)
+        out = next(Path(tmp).glob("*.json"), None)
+        if out is None:
+            sys.exit("mlx_whisper ran but produced no transcript.")
+        result = json.loads(out.read_text(encoding="utf-8"))
     return result["text"].strip(), result.get("language", "?")
+
+
+# Constrained JSON decoding can get stuck emitting blank lines; stop early when it does.
+WHITESPACE_STALL = 40
 
 
 def _stream_chat(body: dict, deadline_s: int) -> tuple[str, str]:
@@ -87,6 +127,10 @@ def _stream_chat(body: dict, deadline_s: int) -> tuple[str, str]:
                 print(f"\033[2m{msg['thinking']}\033[0m", end="", file=sys.stderr, flush=True)
             if piece:
                 print(piece, end="", file=sys.stderr, flush=True)
+                tail = "".join(content)[-WHITESPACE_STALL:]
+                if len(tail) == WHITESPACE_STALL and not tail.strip():
+                    done_reason = "whitespace loop"
+                    break
             if chunk.get("done"):
                 done_reason = chunk.get("done_reason", "")
                 break
@@ -113,18 +157,17 @@ def ask_gemma(transcript: str, model: str) -> dict:
 
     # Attempt 1: schema-constrained output. Attempt 2: plain JSON instructions,
     # in case constrained decoding stalls or loops on this model build.
+    plain_messages = messages[:-1] + [{
+        "role": "user",
+        "content": messages[-1]["content"]
+        + "\n\nAnswer with ONE JSON object only, with exactly these keys: "
+        + ", ".join(SCHEMA["required"]) + ". No markdown, no comments.",
+    }]
+    # Attempt 1: plain JSON instructions (fast and reliable with Gemma 4).
+    # Attempt 2: schema-constrained decoding, as a fallback if attempt 1 is not valid JSON.
     attempts = [
+        {"model": model, "messages": plain_messages, "stream": True, "think": False, "options": options},
         {"model": model, "messages": messages, "format": SCHEMA, "stream": True, "think": False, "options": options},
-        {
-            "model": model,
-            "messages": messages[:-1]
-            + [{"role": "user", "content": messages[-1]["content"]
-                + "\n\nAnswer with ONE JSON object only, with exactly these keys: "
-                + ", ".join(SCHEMA["required"]) + ". No markdown, no comments."}],
-            "stream": True,
-            "think": False,
-            "options": options,
-        },
     ]
 
     for i, body in enumerate(attempts, 1):
